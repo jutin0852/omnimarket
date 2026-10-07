@@ -1,12 +1,20 @@
 import { describe, expect, it } from 'vitest'
-import { fromJson, toJson, ScalarType, type DescField, type DescMessage, type JsonValue } from '@bufbuild/protobuf'
+import { fromJson, toJson, ScalarType, type DescMessage, type JsonValue } from '@bufbuild/protobuf'
 import { file_omnimarket_api_v1_automation } from './generated/omnimarket/api/v1/automation_pb'
 import { file_omnimarket_api_v1_common } from './generated/omnimarket/api/v1/common_pb'
 import { file_omnimarket_api_v1_market } from './generated/omnimarket/api/v1/market_pb'
 import { file_omnimarket_api_v1_stream } from './generated/omnimarket/api/v1/stream_pb'
 import { file_omnimarket_api_v1_trading } from './generated/omnimarket/api/v1/trading_pb'
 import { LineageSchema } from './generated/omnimarket/lineage/v1/lineage_pb'
-import { apiFixturesJson } from '../mocks/fixtures/api'
+import { apiFixtureFiles, apiFixturesJson } from '../mocks/fixtures/api'
+import {
+  checkValues,
+  decimalField,
+  fixtureSchemaForPath,
+  isStringField,
+  type Problem,
+  validateCandleSeriesJson,
+} from './contract-validation'
 
 // The API contract v0 (#75, D91): proto/omnimarket/api/v1, as generated here.
 const apiFiles = [
@@ -48,14 +56,7 @@ const notRecords = new Set([
   'OrderLevel',
 ])
 
-// Fields holding amounts, prices, USD values or percentages: decimal strings on the wire.
-const decimalField = /(^|_)(usd|pct|amount|price|supply|native|bought|returned|spent|quote)$|^amount_|_amount_|^pct_/
-const decimalValue = /^-?(0|[1-9]\d*)(\.\d+)?$/
-// Fields holding addresses or hashes: lowercase 0x hex.
-const hexField = /^(address|pool|token|token_in|token_out|spend_token|sender|recipient|wallet_address|tx_hash|block_hash|head_block_hash|intent_hash|firing_id|last_firing_id)$/
-const hexValue = /^0x[0-9a-f]+$/
-
-function allMessages(roots: DescMessage[]): DescMessage[] {
+function allMessages(roots: readonly DescMessage[]): DescMessage[] {
   const seen = new Map<string, DescMessage>()
   const visit = (desc: DescMessage) => {
     if (seen.has(desc.typeName)) return
@@ -69,44 +70,51 @@ function allMessages(roots: DescMessage[]): DescMessage[] {
   return [...seen.values()]
 }
 
-function isStringField(field: DescField): boolean {
-  return (field.fieldKind === 'scalar' || field.fieldKind === 'list') && field.scalar === ScalarType.STRING
+type ResolvedFixture = { path: string; json: JsonValue; schema: DescMessage }
+
+const resolvedFixtures: ResolvedFixture[] = apiFixtureFiles.flatMap(({ path, json }) => {
+  const schema = fixtureSchemaForPath(path, fixtureMessages)
+  return schema ? [{ path, json, schema }] : []
+})
+const unmappedFixturePaths = apiFixtureFiles
+  .filter(({ path }) => !fixtureSchemaForPath(path, fixtureMessages))
+  .map(({ path }) => path)
+
+function candleFixture(path: string): ResolvedFixture {
+  const fixture = resolvedFixtures.find((candidate) => candidate.path === path)
+  if (!fixture) throw new Error(`missing fixture ${path}`)
+  return fixture
 }
 
-type Problem = string
+function clonedFixture(path: string): Record<string, JsonValue> {
+  const json = structuredClone(candleFixture(path).json)
+  if (json === null || typeof json !== 'object' || Array.isArray(json)) throw new Error(`${path} is not a JSON object`)
+  return json as Record<string, JsonValue>
+}
 
-// Walks a fixture alongside its schema, checking each decimal and hex string.
-function checkValues(desc: DescMessage, json: JsonValue, path: string, problems: Problem[]) {
-  if (json === null || typeof json !== 'object' || Array.isArray(json)) return
-  for (const field of desc.fields) {
-    const value = json[field.jsonName]
-    if (value === undefined) continue
-    const values = Array.isArray(value) ? value : [value]
-    for (const item of values) {
-      const at = `${path}.${field.jsonName}`
-      if (field.message) {
-        checkValues(field.message, item, at, problems)
-      } else if (typeof item === 'string' && decimalField.test(field.name) && !decimalValue.test(item)) {
-        problems.push(`${at} = "${item}" isn't a decimal string`)
-      } else if (typeof item === 'string' && hexField.test(field.name) && !hexValue.test(item)) {
-        problems.push(`${at} = "${item}" isn't lowercase 0x hex`)
-      }
-    }
-  }
+function firstCandle(fixture: Record<string, JsonValue>, path: string): Record<string, JsonValue> {
+  const candles = fixture.candles
+  if (!Array.isArray(candles) || candles.length === 0) throw new Error(`${path} has no candles`)
+  const candle = candles[0]
+  if (candle === null || typeof candle !== 'object' || Array.isArray(candle)) throw new Error(`${path} has an invalid candle`)
+  return candle as Record<string, JsonValue>
 }
 
 describe('API contract v0', () => {
+  it('resolves every recursive fixture to a generated schema', () => {
+    expect(unmappedFixturePaths, `Unmapped fixture JSON: ${unmappedFixturePaths.join(', ')}`).toEqual([])
+  })
+
   it('has a fixture for every message, and no fixture without a message', () => {
     const names = fixtureMessages.map((desc) => desc.name).sort()
     expect(Object.keys(apiFixturesJson).sort()).toEqual(names)
   })
 
-  it.each(fixtureMessages.map((desc) => [desc.name, desc] as const))(
-    'the %s fixture is canonical proto3 JSON for its message',
-    (_name, desc) => {
-      const json = apiFixturesJson[desc.name]
+  it.each(resolvedFixtures.map(({ path, json, schema }) => [path, json, schema] as const))(
+    'the %s fixture is canonical proto3 JSON for its generated schema',
+    (_path, json, schema) => {
       // fromJson rejects unknown fields and wrong types; the round trip rejects non-canonical forms.
-      expect(toJson(desc, fromJson(desc, json))).toEqual(json)
+      expect(toJson(schema, fromJson(schema, json))).toEqual(json)
     },
   )
 
@@ -147,7 +155,39 @@ describe('API contract v0', () => {
 
   it('writes decimals and hex in the agreed forms in every fixture', () => {
     const problems: Problem[] = []
-    for (const desc of fixtureMessages) checkValues(desc, apiFixturesJson[desc.name], desc.name, problems)
+    for (const { path, json, schema } of resolvedFixtures) checkValues(schema, json, path, problems)
     expect(problems).toEqual([])
+  })
+
+  it('validates every candle series fixture', () => {
+    const problems = resolvedFixtures
+      .filter(({ path }) => path.startsWith('candles/'))
+      .flatMap(({ path, json }) => validateCandleSeriesJson(path, json))
+    expect(problems).toEqual([])
+  })
+
+  it('rejects a numeric decimal mutation', () => {
+    const fixture = clonedFixture('candles/15m.json')
+    firstCandle(fixture, 'candles/15m.json').openUsd = 0.0115
+    const problems = validateCandleSeriesJson('candles/15m.json (numeric decimal mutation)', fixture)
+    expect(problems.join('\n')).toMatch(/candles\/15m\.json.*(cannot|invalid|number|string|expected)/i)
+  })
+
+  it('rejects a candle whose high is below its close', () => {
+    const fixture = clonedFixture('candles/15m.json')
+    firstCandle(fixture, 'candles/15m.json').highUsd = '0.01160'
+    const problems = validateCandleSeriesJson('candles/15m.json (OHLC mutation)', fixture)
+    expect(problems).toEqual(expect.arrayContaining([expect.stringContaining('highUsd must bound')]))
+  })
+
+  it('rejects a candle with a misaligned timestamp', () => {
+    const fixture = clonedFixture('candles/15m.json')
+    firstCandle(fixture, 'candles/15m.json').openTimeMs = '1789992900001'
+    const problems = validateCandleSeriesJson('candles/15m.json (timestamp mutation)', fixture)
+    expect(problems).toEqual(expect.arrayContaining([expect.stringContaining('not aligned to its interval')]))
+  })
+
+  it('does not provide a schema for an unmapped fixture path', () => {
+    expect(fixtureSchemaForPath('future/new-fixture.json', fixtureMessages)).toBeUndefined()
   })
 })

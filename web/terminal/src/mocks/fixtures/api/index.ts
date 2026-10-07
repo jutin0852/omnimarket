@@ -4,11 +4,24 @@
 import { fromJson, type DescMessage, type JsonValue, type MessageShape } from '@bufbuild/protobuf'
 import { CandleSeriesSchema } from '../../../api/generated/omnimarket/api/v1/market_pb'
 
-const files = import.meta.glob<JsonValue>('./v1/*.json', { eager: true, import: 'default' })
+const files = import.meta.glob<JsonValue>('./**/*.json', { eager: true, import: 'default' })
+
+export type ApiFixtureFile = Readonly<{
+  /** Path relative to `src/mocks/fixtures/api/`, using `/` separators. */
+  path: string
+  json: JsonValue
+}>
+
+/** Every JSON fixture under this directory, including nested fixture directories. */
+export const apiFixtureFiles: readonly ApiFixtureFile[] = Object.entries(files)
+  .map(([path, json]) => ({ path: path.slice('./'.length), json }))
+  .sort((a, b) => a.path.localeCompare(b.path))
 
 /** The raw proto3 JSON fixtures, keyed by message name. */
 export const apiFixturesJson: Readonly<Record<string, JsonValue>> = Object.fromEntries(
-  Object.entries(files).map(([path, json]) => [path.slice('./v1/'.length, -'.json'.length), json]),
+  apiFixtureFiles
+    .filter(({ path }) => path.startsWith('v1/') && !path.slice('v1/'.length).includes('/'))
+    .map(({ path, json }) => [path.slice('v1/'.length, -'.json'.length), json]),
 )
 
 /** The fixture for a message, as the wire carries it: what an MSW handler responds with. */
@@ -20,7 +33,11 @@ export function apiFixtureJson(schema: DescMessage): JsonValue {
   return json
 }
 
-const candleFiles = import.meta.glob<JsonValue>('./candles/*.json', { eager: true, import: 'default' })
+const candleFiles = Object.fromEntries(
+  apiFixtureFiles
+    .filter(({ path }) => path.startsWith('candles/') && !path.slice('candles/'.length).includes('/'))
+    .map(({ path, json }) => [`./${path}`, json]),
+)
 
 /**
  * The candle series fixture for an interval, as the wire carries it: `candles/<interval>.json`
